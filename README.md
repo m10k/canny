@@ -38,7 +38,7 @@ messages received on one CAN bus will not be forwarded to another.
 To connect two CAN buses over an IP network, start canny on two different machines
 like the following example.
 
-Start a canny server on machine A (let's assume it's IP is 10.0.0.1):
+Start a canny server on machine A (let's assume its IP is 10.0.0.1):
 
 ```
 $ canny -p 1234
