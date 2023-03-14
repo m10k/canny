@@ -159,6 +159,7 @@ static int cansock(void)
 	}
 
 	memset(&addr, 0, sizeof(addr));
+	addr.can_family = AF_CAN;
 
 	if(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
 		e = errno;
