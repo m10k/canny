@@ -34,10 +34,21 @@
 #include <signal.h>
 #include <array.h>
 #include <assert.h>
+#include <getopt.h>
 #include <config.h>
 
 #define FLAG_DAEMON 1
 #define FLAG_LISTEN 2
+
+#define SHORTOPTS   "dc:p:h"
+
+static const struct option cmd_opts[] = {
+	{ "dont-fork", no_argument,       0, 'd' },
+	{ "connect",   required_argument, 0, 'c' },
+	{ "port",      required_argument, 0, 'p' },
+	{ "help",      no_argument,       0, 'h' },
+	{ 0, 0, 0, 0 }
+};
 
 struct conn {
 	int fd;
@@ -265,6 +276,62 @@ static void sigsetup(void)
 	return;
 }
 
+static void print_usage(const char *argv0)
+{
+	printf("Usage: %s [OPTIONS]\n"
+	       "Provide an IP-to-CAN gateway. By default, %s will fork to the background\n"
+	       "and listen for incoming connections on port %d.\n"
+	       "\n"
+	       "The following options are recognized:\n"
+	       "  -d, --dont-fork   don't fork to the background\n"
+	       "  -c, --connect     connect to the host specified by the next argument\n"
+	       "  -p, --port        use the port specified by the next argument\n"
+	       "  -h, --help        display this help and exit\n",
+	       argv0, CONFIG_MY_NAME, CONFIG_INET_PORT);
+}
+
+static int parse_cmdline(int argc, char *argv[], int *flags, int *port, char **hostname)
+{
+	int option;
+
+	do {
+		option = getopt_long(argc, argv, SHORTOPTS, cmd_opts, NULL);
+
+		switch (option) {
+		case 'd':
+			*flags &= ~FLAG_DAEMON;
+			break;
+
+		case 'c':
+			*flags &= ~FLAG_LISTEN;
+			*hostname = optarg;
+			break;
+
+		case 'p':
+			*port = strtol(optarg, NULL, 10);
+
+			if(*port > (1 << 16) || errno == ERANGE) {
+				fprintf(stderr, "Invalid port specified\n");
+				return -ERANGE;
+			}
+			break;
+
+		case 'h':
+			print_usage(argv[0]);
+			return -1;
+
+		case '?':
+			fprintf(stderr, "Unrecognized command line option `%s'\n", optarg);
+			return -EINVAL;
+
+		default:
+			option = -1;
+		}
+	} while (option >= 0);
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	struct epoll_event ev[CONFIG_EPOLL_INITSIZE];
@@ -283,42 +350,8 @@ int main(int argc, char *argv[])
 	ret_val = 1;
 	run = 1;
 
-	for(ret_val = 1; ret_val < argc; ret_val++) {
-		if(strcmp(argv[ret_val], "--dont-fork") == 0 || strcmp(argv[ret_val], "-d") == 0) {
-			flags &= ~FLAG_DAEMON;
-		} else if(strcmp(argv[ret_val], "--connect") == 0 || strcmp(argv[ret_val], "-c") == 0) {
-			if(++ret_val < argc) {
-				flags &= ~FLAG_LISTEN;
-				hostname = argv[ret_val];
-			} else {
-				fprintf(stderr, "Expected destination after --connect\n");
-				return(1);
-			}
-		} else if(strcmp(argv[ret_val], "--port") == 0 || strcmp(argv[ret_val], "-p") == 0) {
-			if(++ret_val < argc) {
-				port = strtol(argv[ret_val], NULL, 10);
-
-				if(port > (1 << 16) || errno == ERANGE) {
-					fprintf(stderr, "Invalid port specified\n");
-					return(1);
-				}
-			} else {
-				fprintf(stderr, "Expected port number after --port\n");
-				return(1);
-			}
-		} else if(strcmp(argv[ret_val], "--help") == 0 || strcmp(argv[ret_val], "-h") == 0) {
-			printf("Usage: %s [OPTIONS]\n"
-			       "Provide an IP-to-CAN gateway. By default, %s will fork to the background\n"
-			       "and listen for incoming connections on port %d.\n"
-			       "\n"
-			       "The following options are recognized:\n"
-			       "  -d, --dont-fork   don't fork to the background\n"
-			       "  -c, --connect     connect to the host specified by the next argument\n"
-			       "  -p, --port        use the port specified by the next argument\n"
-			       "  -h, --help        display this help and exit\n",
-			       argv[0], CONFIG_MY_NAME, CONFIG_INET_PORT);
-			return(1);
-		}
+	if (parse_cmdline(argc, argv, &flags, &port, &hostname) < 0) {
+		return 1;
 	}
 
 	if(!(conns = array_alloc())) {
