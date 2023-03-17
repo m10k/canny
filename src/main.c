@@ -36,17 +36,20 @@
 #include <assert.h>
 #include <getopt.h>
 #include <config.h>
+#include "log.h"
 
 #define FLAG_DAEMON 1
 #define FLAG_LISTEN 2
 
-#define SHORTOPTS   "dc:p:h"
+#define SHORTOPTS   "dc:p:hvq"
 
 static const struct option cmd_opts[] = {
 	{ "dont-fork", no_argument,       0, 'd' },
 	{ "connect",   required_argument, 0, 'c' },
 	{ "port",      required_argument, 0, 'p' },
 	{ "help",      no_argument,       0, 'h' },
+	{ "verbose",   no_argument,       0, 'v' },
+	{ "quiet",     no_argument,       0, 'q' },
 	{ 0, 0, 0, 0 }
 };
 
@@ -83,7 +86,7 @@ static int in6connect(const char *host, unsigned short port)
 	snprintf(portstr, sizeof(portstr), "%hu", port);
 
 	if((err = getaddrinfo(host, portstr, &hints, &res)) != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
+		log_error("getaddrinfo: %s\n", gai_strerror(err));
 		ret_val = -ENOENT;
 	} else {
 		for(p = res; p; p = p->ai_next) {
@@ -91,13 +94,13 @@ static int in6connect(const char *host, unsigned short port)
 
 			if((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) {
 				ret_val = -errno;
-				perror("socket");
+				log_perror("socket");
 				continue;
 			}
 
 			if((err = connect(fd, p->ai_addr, p->ai_addrlen)) < 0) {
 				ret_val = -errno;
-				perror("connect");
+				log_perror("connect");
 				close(fd);
 			} else {
 				ret_val = fd;
@@ -119,7 +122,7 @@ static int in6listen(unsigned short port)
 
 	if((fd = socket(PF_INET6, SOCK_STREAM, 0)) < 0) {
 		err = errno;
-		perror("socket");
+		log_perror("socket");
 		return(-err);
 	}
 
@@ -130,19 +133,19 @@ static int in6listen(unsigned short port)
 	err = 1;
 
 	if(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &err, sizeof(err)) < 0) {
-		perror("setsockopt");
+		log_perror("setsockopt");
 	}
 
 	if(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
 		err = errno;
-		perror("bind");
+		log_perror("bind");
 		close(fd);
 		return(-err);
 	}
 
 	if(listen(fd, CONFIG_INET_BACKLOG) < 0) {
 		err = errno;
-		perror("listen");
+		log_perror("listen");
 		close(fd);
 		return(-err);
 	}
@@ -164,7 +167,7 @@ static int cansock(void)
 
 	if((fd = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
 		e = errno;
-		perror("socket");
+		log_perror("socket");
 		errno = e;
 		return(-1);
 	}
@@ -174,7 +177,7 @@ static int cansock(void)
 
 	if(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
 		e = errno;
-		perror("bind");
+		log_perror("bind");
 		close(fd);
 		free(ifaces);
 		ifaces = NULL;
@@ -213,7 +216,7 @@ static void broadcast_can(struct can_frame *frm)
 {
 	ARRAY_FOREACH(ifaces, struct can_iface, iface, {
 		if(sendto(iface->fd, frm, sizeof(*frm), 0, (struct sockaddr*)&(iface->addr), sizeof(iface->addr)) < 0) {
-			perror("sendto");
+			log_perror("sendto");
 		}
 	});
 
@@ -224,7 +227,7 @@ static void broadcast_net(struct can_frame *frm)
 {
 	ARRAY_FOREACH(conns, struct conn, con, {
 		if(send(con->fd, frm, sizeof(*frm), 0) < 0) {
-			perror("send");
+			log_perror("send");
 		}
 	});
 
@@ -239,7 +242,7 @@ static void broadcast_net2(struct can_frame *frm, struct conn *src)
 		}
 
 		if(send(con->fd, frm, sizeof(*frm), 0) < 0) {
-			perror("send");
+			log_perror("send");
 		}
 	});
 
@@ -286,7 +289,9 @@ static void print_usage(const char *argv0)
 	       "  -d, --dont-fork   don't fork to the background\n"
 	       "  -c, --connect     connect to the host specified by the next argument\n"
 	       "  -p, --port        use the port specified by the next argument\n"
-	       "  -h, --help        display this help and exit\n",
+	       "  -h, --help        display this help and exit\n"
+	       "  -v, --verbose     be more verbose\n"
+	       "  -q, --quiet       be less verbose\n",
 	       argv0, CONFIG_MY_NAME, CONFIG_INET_PORT);
 }
 
@@ -311,7 +316,7 @@ static int parse_cmdline(int argc, char *argv[], int *flags, int *port, char **h
 			*port = strtol(optarg, NULL, 10);
 
 			if(*port > (1 << 16) || errno == ERANGE) {
-				fprintf(stderr, "Invalid port specified\n");
+				log_error("Invalid port specified\n");
 				return -ERANGE;
 			}
 			break;
@@ -320,8 +325,16 @@ static int parse_cmdline(int argc, char *argv[], int *flags, int *port, char **h
 			print_usage(argv[0]);
 			return -1;
 
+		case 'v':
+			log_increase_verbosity(1);
+			break;
+
+		case 'q':
+			log_increase_verbosity(-1);
+			break;
+
 		case '?':
-			fprintf(stderr, "Unrecognized command line option `%s'\n", optarg);
+		        log_error("Unrecognized command line option `%s'\n", optarg);
 			return -EINVAL;
 
 		default:
@@ -355,7 +368,7 @@ int main(int argc, char *argv[])
 	}
 
 	if(!(conns = array_alloc())) {
-		perror("array_alloc");
+		log_error("Not enough memory for connection array\n");
 		return(1);
 	}
 
@@ -369,7 +382,7 @@ int main(int argc, char *argv[])
 		if(pid > 0) {
 			return(0);
 		} else if(pid < 0) {
-			perror("fork");
+			log_perror("fork");
 			return(1);
 		}
 
@@ -378,12 +391,12 @@ int main(int argc, char *argv[])
 	sigsetup();
 
 	if((canfd = cansock()) < 0) {
-		fprintf(stderr, "Failed to initialize CAN socket\n");
+		log_error("Failed to initialize CAN socket\n");
 		return(1);
 	}
 
 	if((epfd = epoll_create(CONFIG_EPOLL_INITSIZE)) < 0) {
-		perror("epoll_create");
+		log_perror("epoll_create");
 		close(canfd);
 		return(1);
 	} else {
@@ -391,7 +404,7 @@ int main(int argc, char *argv[])
 		ev[0].events = EPOLLIN;
 
 		if(epoll_ctl(epfd, EPOLL_CTL_ADD, canfd, &ev[0]) < 0) {
-			perror("epoll_ctl");
+			log_perror("epoll_ctl");
 			close(epfd);
 			close(canfd);
 			return(1);
@@ -404,7 +417,7 @@ int main(int argc, char *argv[])
 			ev[0].events = EPOLLIN;
 
 			if(epoll_ctl(epfd, EPOLL_CTL_ADD, netfd, &ev[0]) < 0) {
-				perror("epoll_ctl");
+				log_perror("epoll_ctl");
 				ret_val = -1;
 			} else{
 				while(run) {
@@ -426,7 +439,7 @@ int main(int argc, char *argv[])
 							socklen_t addrlen;
 
 							if(!(new_con = malloc(sizeof(*new_con)))) {
-								perror("malloc");
+								log_perror("malloc");
 							} else {
 								new_con->fd = accept(con->fd, (struct sockaddr*)&(new_con->addr), &addrlen);
 
@@ -437,11 +450,11 @@ int main(int argc, char *argv[])
 									nev.events = EPOLLIN;
 
 									if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_con->fd, &nev) < 0) {
-										perror("epoll_ctl");
+										log_perror("epoll_ctl");
 										close(new_con->fd);
 										free(new_con);
 									} else if((err = array_insert(conns, new_con)) < 0) {
-										fprintf(stderr, "array_insert: %s\n", strerror(-err));
+										log_error("array_insert: %s\n", strerror(-err));
 										close(new_con->fd);
 										free(new_con);
 									}
@@ -454,11 +467,11 @@ int main(int argc, char *argv[])
 							int flen;
 
 							if((flen = read(con->fd, &frm, sizeof(frm))) < 0) {
-								perror("read");
+								log_perror("read");
 							} else if(flen == sizeof(frm)) {
 								broadcast_net(&frm);
 							} else {
-								fprintf(stderr, "flen = %d\n", flen);
+								log_error("flen = %d\n", flen);
 							}
 						} else {
 							/* message from TCP client -> broadcast to TCP clients and CAN bus */
@@ -515,13 +528,13 @@ int main(int argc, char *argv[])
 		}
 	} else { /* if(flags & FLAG_LISTEN) */
 		if((netfd = in6connect(hostname, port & 0xffff)) < 0) {
-			fprintf(stderr, "Unable to connect to %s:%d\n", hostname, port & 0xffff);
+			log_error("Unable to connect to %s:%d\n", hostname, port & 0xffff);
 		} else {
 			ev[0].data.ptr = &netfd;
 			ev[0].events = EPOLLIN;
 
 			if(epoll_ctl(epfd, EPOLL_CTL_ADD, netfd, &ev[0]) < 0) {
-				perror("epoll_ctl");
+				log_perror("epoll_ctl");
 			} else {
 				union {
 					struct can_frame frame[CONFIG_BUFFER_FRAMES];
@@ -546,7 +559,7 @@ int main(int argc, char *argv[])
 
 							if(len == sizeof(frm)) {
 								if(send(netfd, &frm, sizeof(frm), 0) < 0) {
-									perror("send");
+									log_perror("send");
 									close(netfd);
 									run = 0;
 								}

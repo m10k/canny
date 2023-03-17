@@ -1,6 +1,6 @@
 CFLAGS = -Wall -g -Wextra -Wdouble-promotion -Wmissing-include-dirs -Wswitch-default -Wswitch-enum -c -fPIC -I.. -I.
 LDFLAGS = -lpthread
-OBJECTS = main.o array.o
+OBJECTS = main.o array.o log.o
 OUTNAME = canny
 
 all: $(OUTNAME)
