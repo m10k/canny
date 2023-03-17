@@ -1,6 +1,6 @@
 /*
  * Canny - A simple CAN-over-IP gateway
- * Copyright (C) 2016 Matthias Kruk
+ * Copyright (C) 2016-2023 Matthias Kruk
  *
  * Canny is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published
@@ -27,11 +27,12 @@
 #include <pthread.h>
 #include <errno.h>
 
-#define	ARRAY_INIT_SIZE		16
-#define ARRAY_INC_SHIFT		1
-#define ARRAY_DEC_SHIFT		1
+#define ARRAY_INIT_SIZE 16
+#define ARRAY_INC_SHIFT 1
+#define ARRAY_DEC_SHIFT 1
 
-static size_t _array_increase(array_t *this) {
+static size_t _array_increase(array_t *this)
+{
 	size_t nsize, nsize_raw;
 	void **ndata;
 
@@ -54,7 +55,8 @@ static size_t _array_increase(array_t *this) {
 	return(0);
 }
 
-static size_t _array_decrease(array_t *this) {
+static size_t _array_decrease(array_t *this)
+{
 	size_t nsize, nsize_raw;
 	void **ndata;
 
@@ -69,7 +71,7 @@ static size_t _array_decrease(array_t *this) {
 		int i, n;
 
 		memset(ndata, 0, nsize_raw);
-		
+
 		for(i = 0, n = 0; i < this->a_size && n < this->a_used; i++) {
 			if(this->a_data[i] > ARRAY_DIRTY_MARK) {
 				ndata[n] = this->a_data[i];
@@ -91,7 +93,8 @@ static size_t _array_decrease(array_t *this) {
  * Allocate a new array
  * @return a pointer to the new array, or NULL in case of an error
  */
-array_t* array_alloc(void) {
+array_t* array_alloc(void)
+{
 	array_t *a;
 
 	if((a = malloc(sizeof(*a)))) {
@@ -118,7 +121,8 @@ array_t* array_alloc(void) {
  * @param this the array to be freed
  * @return void
  */
-void array_free(array_t *this) {
+void array_free(array_t *this)
+{
 	assert(this);
 	assert(pthread_mutex_lock(&(this->a_lock)) == 0);
 
@@ -137,7 +141,8 @@ void array_free(array_t *this) {
  * @param this the array
  * @return the number of elements in the array
  */
-int array_get_length(array_t *this) {
+int array_get_length(array_t *this)
+{
 	int len;
 
 	assert(this);
@@ -155,7 +160,8 @@ int array_get_length(array_t *this) {
  * @param ptr the element to be inserted
  * @return a non-negative value on success, or a negative value in case of an error
  */
-int array_insert(array_t *this, const void *ptr) {
+int array_insert(array_t *this, const void *ptr)
+{
 	int i;
 
 	assert(this != NULL);
@@ -190,7 +196,8 @@ int array_insert(array_t *this, const void *ptr) {
  * @param ptr the element to be removed
  * @return a non-negative value on success, or a negative value of the element was not found
  */
-int array_remove(array_t *this, const void *ptr) {
+int array_remove(array_t *this, const void *ptr)
+{
 	int i;
 
 	assert(this);
@@ -223,7 +230,8 @@ int array_remove(array_t *this, const void *ptr) {
  * @param func the function to call for each element
  * @return void
  */
-void array_foreach(array_t *this, void (*func)(void*)) {
+void array_foreach(array_t *this, void (*func)(void*))
+{
 	int i, d;
 
 	assert(this);
@@ -249,7 +257,8 @@ void array_foreach(array_t *this, void (*func)(void*)) {
  * @param data the value to pass as the second argument to the function
  * @return void
  */
-void array_foreach2(array_t *this, void (*func)(void*, void*), void *data) {
+void array_foreach2(array_t *this, void (*func)(void*, void*), void *data)
+{
 	int i, d;
 
 	assert(this);
@@ -274,7 +283,8 @@ void array_foreach2(array_t *this, void (*func)(void*, void*), void *data) {
  * @param n the index into the array
  * @return a pointer to the nth element in the array, or NULL if n is outside the array bounds
  */
-void* array_get_nth(array_t *this, int n) {
+void* array_get_nth(array_t *this, int n)
+{
 	int i;
 	void *ptr;
 
@@ -306,7 +316,8 @@ void* array_get_nth(array_t *this, int n) {
  * @param arg the second argument to the comparator function
  * @return a pointer to the located element, or NULL if no element could be found
  */
-void* array_find(array_t *this, int (*cmp)(void*, void*), void *arg) {
+void* array_find(array_t *this, int (*cmp)(void*, void*), void *arg)
+{
 	int i, d;
 	void *ptr;
 
@@ -345,8 +356,8 @@ array_t* array_dup(array_t *this)
 
 	if((a = array_alloc())) {
 		ARRAY_FOREACH(this, void, elem, {
-				array_insert(a, elem);
-			});
+			array_insert(a, elem);
+		});
 	}
 
 	return(a);

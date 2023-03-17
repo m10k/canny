@@ -1,6 +1,6 @@
 /*
  * Canny - A simple CAN-over-IP gateway
- * Copyright (C) 2016 Matthias Kruk
+ * Copyright (C) 2016-2023 Matthias Kruk
  *
  * Canny is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published
@@ -26,40 +26,40 @@
 typedef struct array array_t;
 
 struct array {
-	int		a_size;
-	int		a_used;
-	int		a_next;
-	void	**a_data;
+	int             a_size;
+	int             a_used;
+	int             a_next;
+	void            **a_data;
 
 	pthread_mutex_t a_lock;
 };
 
-#define ARRAY_DIRTY_MARK	((void*)0x1)
+#define ARRAY_DIRTY_MARK ((void*)0x1)
 
-#define	ARRAY_FOREACH(arr,type,elem,what)	if(pthread_mutex_lock(&((arr)->a_lock)) == 0) { \
-												int __iter_##elem; \
-												for(__iter_##elem = 0; __iter_##elem < (arr)->a_size; __iter_##elem++) { \
-													type *elem = (type*)(arr)->a_data[__iter_##elem]; \
-													if((void*)elem > ARRAY_DIRTY_MARK) \
-														what \
-												} \
-												assert(pthread_mutex_unlock(&((arr)->a_lock)) == 0); \
-											}
+#define	ARRAY_FOREACH(arr,type,elem,what) if(pthread_mutex_lock(&((arr)->a_lock)) == 0) { \
+		int __iter_##elem;                                                        \
+		for(__iter_##elem = 0; __iter_##elem < (arr)->a_size; __iter_##elem++) {  \
+			type *elem = (type*)(arr)->a_data[__iter_##elem];                 \
+			if((void*)elem > ARRAY_DIRTY_MARK)                                \
+				what                                                      \
+		}                                                                         \
+		assert(pthread_mutex_unlock(&((arr)->a_lock)) == 0);                      \
+	}
 
-array_t*	array_alloc(void);
-void		array_free(array_t*);
+array_t* array_alloc(void);
+void     array_free(array_t*);
 
-int			array_insert(array_t*, const void*);
-int			array_remove(array_t*, const void*);
+int      array_insert(array_t*, const void*);
+int      array_remove(array_t*, const void*);
 
-void*		array_get_nth(array_t*, int);
-int			array_get_length(array_t*);
+void*    array_get_nth(array_t*, int);
+int      array_get_length(array_t*);
 
-void		array_foreach(array_t*, void(*)(void*));
-void		array_foreach2(array_t*, void(*)(void*, void*), void*);
-void*		array_find(array_t*, int(*)(void*,void*), void*);
-array_t*    array_dup(array_t*);
+void     array_foreach(array_t*, void(*)(void*));
+void     array_foreach2(array_t*, void(*)(void*, void*), void*);
+void*    array_find(array_t*, int(*)(void*,void*), void*);
+array_t* array_dup(array_t*);
 
-void		array_debug(array_t*);
+void     array_debug(array_t*);
 
 #endif /* __ARRAY_H */
