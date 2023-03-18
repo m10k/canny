@@ -538,35 +538,35 @@ int main(int argc, char *argv[])
 			close(netfd);
 		}
 	} else { /* if(flags & FLAG_LISTEN) */
+		struct in6_connection client;
+
+		memset(&client, 0, sizeof(client));
+
 		if((netfd = in6connect(hostname, port & 0xffff)) < 0) {
 			log_error("Unable to connect to %s:%d\n", hostname, port & 0xffff);
 		} else {
-			ev[0].data.ptr = &netfd;
+			client.conn.fd = netfd;
+			ev[0].data.ptr = &client;
 			ev[0].events = EPOLLIN;
 
-			if(epoll_ctl(epfd, EPOLL_CTL_ADD, netfd, &ev[0]) < 0) {
+			if(epoll_ctl(epfd, EPOLL_CTL_ADD, client.conn.fd, &ev[0]) < 0) {
 				log_perror("epoll_ctl");
 			} else {
-				union {
-					struct can_frame frame[CONFIG_BUFFER_FRAMES];
-					unsigned char raw[CONFIG_BUFFER_FRAMES * sizeof(struct can_frame)];
-				} buffer;
-				size_t dlen;
 				int n;
-
-				dlen = 0;
 
 				while(run) {
 					n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
 
 					while(--n >= 0) {
-						int fd = *((int*)ev[n].data.ptr);
+						struct connection *con;
 						int len;
 
-						if(fd == canfd) {
+						con = (struct connection*)ev[n].data.ptr;
+
+						if(con->fd == canfd) {
 							struct can_frame frm;
 
-							len = read(fd, &frm, sizeof(frm));
+							len = read(con->fd, &frm, sizeof(frm));
 
 							if(len == sizeof(frm)) {
 								if(send(netfd, &frm, sizeof(frm), 0) < 0) {
@@ -578,38 +578,38 @@ int main(int argc, char *argv[])
 						} else {
 							size_t rsize;
 
-							rsize = sizeof(buffer) - dlen;
+							rsize = sizeof(client.data) - client.dlen;
 
 							if(rsize > 0) {
-								len = recv(netfd, buffer.raw + dlen, rsize, 0);
+								len = recv(netfd, client.data.raw + client.dlen, rsize, 0);
 
 								if(len > 0) {
-									dlen += len;
+									client.dlen += len;
 								}
 							}
 
 							/* broadcast buffered frames */
-							if(dlen >= sizeof(struct can_frame)) {
+							if(client.dlen >= sizeof(struct can_frame)) {
 								size_t new_dlen;
 								int idx;
 
 								idx = 0;
-								new_dlen = dlen;
+								new_dlen = client.dlen;
 
 								/* send out the frames that were fully buffered */
 
 								while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-									broadcast_can(&(buffer.frame[idx]));
+									broadcast_can(&(client.data.frame[idx]));
 									idx++;
 									new_dlen -= sizeof(struct can_frame);
 								}
 
 								/* if we have a partial frame, move it to the front of the buffer */
 								if(new_dlen > 0) {
-									memcpy(buffer.raw, buffer.raw + (dlen - new_dlen), new_dlen);
+									memcpy(client.data.raw, client.data.raw + (client.dlen - new_dlen), new_dlen);
 								}
 
-								dlen = new_dlen;
+								client.dlen = new_dlen;
 							}
 
 							if(len <= 0) {
