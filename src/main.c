@@ -167,10 +167,6 @@ static int cansock(void)
 	int res;
 	int e;
 
-	if(!(ifaces = array_alloc())) {
-		return(-1);
-	}
-
 	if((fd = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
 		e = errno;
 		log_perror("socket");
@@ -377,6 +373,10 @@ int main(int argc, char *argv[])
 
 	if(!(conns = array_alloc())) {
 		log_error("Not enough memory for connection array\n");
+		return(1);
+	}
+	if(!(ifaces = array_alloc())) {
+		log_error("Not enough memory for interface array\n");
 		return(1);
 	}
 
