@@ -78,6 +78,7 @@ struct can_iface {
 static array_t *conns;
 static array_t *ifaces;
 static int run;
+static int epfd;
 
 static int in6connect(const char *host, unsigned short port)
 {
@@ -159,61 +160,120 @@ static int in6listen(unsigned short port)
 	return(fd);
 }
 
-static int cansock(void)
+static int cansock(int ifindex)
 {
 	struct sockaddr_can addr;
-	struct ifreq ifr;
+	int result;
 	int fd;
-	int res;
-	int e;
-
-	if((fd = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
-		e = errno;
-		log_perror("socket");
-		errno = e;
-		return(-1);
-	}
 
 	memset(&addr, 0, sizeof(addr));
 	addr.can_family = AF_CAN;
+	addr.can_ifindex = ifindex;
 
-	if(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-		e = errno;
+	if ((fd = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
+		result = -errno;
+		log_perror("socket");
+	} else if(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+		result = -errno;
 		log_perror("bind");
 		close(fd);
-		free(ifaces);
-		ifaces = NULL;
-		errno = e;
-		return(-1);
+	} else {
+		result = fd;
+	}
+
+	return result;
+}
+
+static int watch_fd(int fd, void *data)
+{
+	struct epoll_event ev;
+	int err;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.data.ptr = data;
+	ev.events = EPOLLIN;
+	err = 0;
+
+	if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+		log_perror("epoll_ctl");
+		err = 1;
+	}
+
+	return err;
+}
+
+static struct can_iface* can_open(int ifindex)
+{
+	struct can_iface *iface;
+	int fd;
+
+	if ((fd = cansock(ifindex) < 0)) {
+		return NULL;
+	}
+
+	if (!(iface = calloc(1, sizeof(*iface)))) {
+		close(fd);
+	} else {
+		iface->conn.fd = fd;
+		iface->conn.addr = (struct sockaddr*)&iface->addr;
+		iface->conn.addr_size = sizeof(iface->addr);
+		iface->addr.can_family = AF_CAN;
+		iface->addr.can_ifindex = ifindex;
+	}
+
+	return iface;
+}
+
+static void can_free(struct can_iface *iface)
+{
+	close(iface->conn.fd);
+	free(iface);
+}
+
+static int can_init(void)
+{
+	struct ifreq ifr;
+	int fd;
+	int err;
+
+	if((fd = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
+		err = -errno;
+		log_perror("socket");
+		return err;
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_ifindex = 1;
 
-	do {
-		if((res = ioctl(fd, SIOCGIFNAME, &ifr)) >= 0) {
-			if(strstr(ifr.ifr_name, "can") != NULL) {
-				struct can_iface *iface;
+	while ((err = ioctl(fd, SIOCGIFNAME, &ifr)) >= 0) {
+		if (strstr(ifr.ifr_name, "can") != NULL) {
+			struct can_iface *iface;
 
-				if((iface = malloc(sizeof(*iface)))) {
-					memset(iface, 0, sizeof(*iface));
+			log_info("Found CAN interface: %s\n", ifr.ifr_name);
 
-					iface->conn.fd = fd;
-					iface->conn.addr = (struct sockaddr*)&iface->addr;
-					iface->conn.addr_size = sizeof(iface->conn);
-					iface->addr.can_ifindex = ifr.ifr_ifindex;
-					iface->addr.can_family = AF_CAN;
+			if (!(iface = can_open(ifr.ifr_ifindex))) {
+				log_warn("Could not open interface %s\n", ifr.ifr_name);
 
-					if(array_insert(ifaces, iface) < 0) {
-						free(iface);
-					}
-				}
+			} else if (watch_fd(iface->conn.fd, iface) < 0) {
+				log_error("Could not add interface %s (fd %d) to epoll set\n",
+					  ifr.ifr_name, iface->conn.fd);
+				can_free(iface);
+
+			} else if (array_insert(ifaces, iface) < 0) {
+				log_warn("Could not add %s to interface list\n", ifr.ifr_name);
+				can_free(iface);
+
+			} else {
+				log_info("Listening for messages on %s (fd %d)\n",
+					 ifr.ifr_name, iface->conn.fd);
 			}
 		}
-		ifr.ifr_ifindex++;
-	} while(res >= 0);
 
-	return(fd);
+		ifr.ifr_ifindex++;
+	}
+
+	close(fd);
+	return 0;
 }
 
 static void broadcast_can(struct can_frame *frm)
@@ -354,9 +414,7 @@ int main(int argc, char *argv[])
 	struct epoll_event ev[CONFIG_EPOLL_INITSIZE];
 	char *hostname;
 	int port;
-	int epfd;
 	int netfd;
-	int canfd;
 	int ret_val;
 	int flags;
 	int err;
@@ -398,25 +456,14 @@ int main(int argc, char *argv[])
 	}
 	sigsetup();
 
-	if((canfd = cansock()) < 0) {
-		log_error("Failed to initialize CAN socket\n");
+	if ((epfd = epoll_create(CONFIG_EPOLL_INITSIZE)) < 0) {
+		log_perror("epoll_create");
 		return(1);
 	}
 
-	if((epfd = epoll_create(CONFIG_EPOLL_INITSIZE)) < 0) {
-		log_perror("epoll_create");
-		close(canfd);
+	if(can_init() < 0) {
+		log_error("Failed to initialize CAN sockets\n");
 		return(1);
-	} else {
-		ev[0].data.ptr = &canfd;
-		ev[0].events = EPOLLIN;
-
-		if(epoll_ctl(epfd, EPOLL_CTL_ADD, canfd, &ev[0]) < 0) {
-			log_perror("epoll_ctl");
-			close(epfd);
-			close(canfd);
-			return(1);
-		}
 	}
 
 	if(flags & FLAG_LISTEN) {
@@ -436,8 +483,8 @@ int main(int argc, char *argv[])
 
 						con = ev[n].data.ptr;
 
-						/* If con->fd is netfd or canfd, don't use any other members of con!
-						   In these cases, con really points to just an int, not a struct conn! */
+						/* If con->fd is netfd, don't use any other members of con!
+						   In this case, con really points to just an int, not a struct conn! */
 
 						if(con->fd == netfd) {
 							/* new TCP connection -> set up connection */
@@ -469,7 +516,7 @@ int main(int argc, char *argv[])
 									}
 								}
 							}
-						} else if(con->fd == canfd) {
+						} else if(con->addr->sa_family == AF_CAN) {
 							/* message from CAN bus -> broadcast to TCP clients */
 
 							struct can_frame frm;
@@ -563,7 +610,7 @@ int main(int argc, char *argv[])
 
 						con = (struct connection*)ev[n].data.ptr;
 
-						if(con->fd == canfd) {
+						if(con->addr->sa_family == AF_CAN) {
 							struct can_frame frm;
 
 							len = read(con->fd, &frm, sizeof(frm));
@@ -625,7 +672,6 @@ int main(int argc, char *argv[])
 	}
 
 	close(epfd);
-	close(canfd);
 
 	return(ret_val);
 }
