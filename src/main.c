@@ -53,8 +53,14 @@ static const struct option cmd_opts[] = {
 	{ 0, 0, 0, 0 }
 };
 
-struct conn {
+struct connection {
 	int fd;
+	struct sockaddr *addr;
+	socklen_t addr_size;
+};
+
+struct in6_connection {
+	struct connection conn;
 	struct sockaddr_in6 addr;
 
 	union {
@@ -65,7 +71,7 @@ struct conn {
 };
 
 struct can_iface {
-	int fd;
+	struct connection conn;
 	struct sockaddr_can addr;
 };
 
@@ -196,7 +202,9 @@ static int cansock(void)
 				if((iface = malloc(sizeof(*iface)))) {
 					memset(iface, 0, sizeof(*iface));
 
-					iface->fd = fd;
+					iface->conn.fd = fd;
+					iface->conn.addr = (struct sockaddr*)&iface->addr;
+					iface->conn.addr_size = sizeof(iface->conn);
 					iface->addr.can_ifindex = ifr.ifr_ifindex;
 					iface->addr.can_family = AF_CAN;
 
@@ -214,8 +222,8 @@ static int cansock(void)
 
 static void broadcast_can(struct can_frame *frm)
 {
-	ARRAY_FOREACH(ifaces, struct can_iface, iface, {
-		if(sendto(iface->fd, frm, sizeof(*frm), 0, (struct sockaddr*)&(iface->addr), sizeof(iface->addr)) < 0) {
+	ARRAY_FOREACH(ifaces, struct connection, con, {
+		if(sendto(con->fd, frm, sizeof(*frm), 0, con->addr, con->addr_size) < 0) {
 			log_perror("sendto");
 		}
 	});
@@ -225,7 +233,7 @@ static void broadcast_can(struct can_frame *frm)
 
 static void broadcast_net(struct can_frame *frm)
 {
-	ARRAY_FOREACH(conns, struct conn, con, {
+	ARRAY_FOREACH(conns, struct connection, con, {
 		if(send(con->fd, frm, sizeof(*frm), 0) < 0) {
 			log_perror("send");
 		}
@@ -234,9 +242,9 @@ static void broadcast_net(struct can_frame *frm)
 	return;
 }
 
-static void broadcast_net2(struct can_frame *frm, struct conn *src)
+static void broadcast_net2(struct can_frame *frm, struct connection *src)
 {
-	ARRAY_FOREACH(conns, struct conn, con, {
+	ARRAY_FOREACH(conns, struct connection, con, {
 		if(con->fd == src->fd) {
 			continue;
 		}
@@ -424,7 +432,7 @@ int main(int argc, char *argv[])
 					int n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
 
 					while(--n >= 0) {
-						struct conn *con;
+						struct connection *con;
 
 						con = ev[n].data.ptr;
 
@@ -435,28 +443,29 @@ int main(int argc, char *argv[])
 							/* new TCP connection -> set up connection */
 
 							struct epoll_event nev;
-							struct conn *new_con;
-							socklen_t addrlen;
+							struct in6_connection *new_client;
 
-							if(!(new_con = malloc(sizeof(*new_con)))) {
-								log_perror("malloc");
+							if (!(new_client = calloc(1, sizeof(*new_client)))) {
+								log_perror("calloc");
 							} else {
-								new_con->fd = accept(con->fd, (struct sockaddr*)&(new_con->addr), &addrlen);
+								new_client->conn.addr = (struct sockaddr*)&new_client->addr;
+								new_client->conn.addr_size = sizeof(new_client->addr);
+							        new_client->conn.fd = accept(con->fd, new_client->conn.addr, &new_client->conn.addr_size);
 
-								if(new_con->fd < 0) {
-									free(new_con);
+								if(new_client->conn.fd < 0) {
+									free(new_client);
 								} else {
-									nev.data.ptr = new_con;
+									nev.data.ptr = new_client;
 									nev.events = EPOLLIN;
 
-									if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_con->fd, &nev) < 0) {
+									if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_client->conn.fd, &nev) < 0) {
 										log_perror("epoll_ctl");
-										close(new_con->fd);
-										free(new_con);
-									} else if((err = array_insert(conns, new_con)) < 0) {
+										close(new_client->conn.fd);
+										free(new_client);
+									} else if((err = array_insert(conns, new_client)) < 0) {
 										log_error("array_insert: %s\n", strerror(-err));
-										close(new_con->fd);
-										free(new_con);
+										close(new_client->conn.fd);
+										free(new_client);
 									}
 								}
 							}
@@ -476,49 +485,51 @@ int main(int argc, char *argv[])
 						} else {
 							/* message from TCP client -> broadcast to TCP clients and CAN bus */
 
+							struct in6_connection *client;
 							size_t rsize;
 							int rd;
 
-							rsize = sizeof(con->data) - con->dlen;
+							client = (struct in6_connection*)con;
+							rsize = sizeof(client->data) - client->dlen;
 
 							if(rsize > 0) {
-								rd = recv(con->fd, con->data.raw + con->dlen, rsize, 0);
+								rd = recv(client->conn.fd, client->data.raw + client->dlen, rsize, 0);
 
 								if(rd > 0) {
-									con->dlen += rd;
+									client->dlen += rd;
 								}
 							}
 
 							/* broadcast buffered frames */
-							if(con->dlen >= sizeof(struct can_frame)) {
+							if(client->dlen >= sizeof(struct can_frame)) {
 								size_t new_dlen;
 								int idx;
 
 								idx = 0;
-								new_dlen = con->dlen;
+								new_dlen = client->dlen;
 
 								/* send out the frames that were fully buffered */
 
 								while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-									broadcast_can(&(con->data.frame[idx]));
-									broadcast_net2(&(con->data.frame[idx]), con);
+									broadcast_can(&(client->data.frame[idx]));
+									broadcast_net2(&(client->data.frame[idx]), (struct connection*)client);
 									idx++;
 									new_dlen -= sizeof(struct can_frame);
 								}
 
 								/* if we have a partial frame, move it to the front of the buffer */
 								if(new_dlen > 0) {
-									memcpy(con->data.raw, con->data.raw + (con->dlen - new_dlen), new_dlen);
+									memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
 								}
 
-								con->dlen = new_dlen;
+								client->dlen = new_dlen;
 							}
 
 							if(rd <= 0) {
 								/* error (-1) or connection closed (0) */
-								array_remove(conns, con);
-								close(con->fd);
-								free(con);
+								array_remove(conns, client);
+								close(client->conn.fd);
+								free(client);
 							}
 						}
 					}
