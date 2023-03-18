@@ -70,6 +70,11 @@ struct in6_connection {
 	size_t dlen;
 };
 
+struct in6_server {
+	struct connection conn;
+	struct sockaddr_in6 addr;
+};
+
 struct can_iface {
 	struct connection conn;
 	struct sockaddr_can addr;
@@ -158,6 +163,32 @@ static int in6listen(unsigned short port)
 	}
 
 	return(fd);
+}
+
+static struct in6_server* in6_server(unsigned short port)
+{
+	struct in6_server *server;
+	int fd;
+
+	if((fd = in6listen(port)) < 0) {
+		return NULL;
+	}
+
+	if (!(server = calloc(1, sizeof(*server)))) {
+		close(fd);
+	} else {
+		/*
+		 * We don't need the address structure, so we don't really
+		 * bother that in6listen() does not use the one in the
+		 * in6_server we're allocating here. This will need to be
+		 * changed in case we ever need the address.
+		 */
+		server->conn.fd = fd;
+		server->conn.addr = (struct sockaddr*)&server->addr;
+		server->conn.addr_size = sizeof(server->addr);
+	}
+
+	return server;
 }
 
 static int cansock(int ifindex)
@@ -273,6 +304,31 @@ static int can_init(void)
 	}
 
 	close(fd);
+	return 0;
+}
+
+static void in6_server_free(struct in6_server *server)
+{
+	close(server->conn.fd);
+	free(server);
+}
+
+static int server_init(unsigned short port)
+{
+	struct in6_server *server;
+
+	if (!(server = in6_server(port & 0xffff))) {
+		log_error("Could not listen on port %hu\n", port);
+		return 1;
+
+	} else if (watch_fd(server->conn.fd, server) < 0) {
+		log_error("Could not add server (fd %d) to epoll set\n", server->conn.fd);
+		in6_server_free(server);
+
+	} else {
+		log_info("Waiting for clients on port %hu (fd %d)\n", port, server->conn.fd);
+	}
+
 	return 0;
 }
 
@@ -467,123 +523,118 @@ int main(int argc, char *argv[])
 	}
 
 	if(flags & FLAG_LISTEN) {
-		if((netfd = in6listen(port & 0xffff)) >= 0) {
-			ev[0].data.ptr = &netfd;
-			ev[0].events = EPOLLIN;
+		if (server_init(port & 0xffff) < 0) {
+			return 1;
+		}
 
-			if(epoll_ctl(epfd, EPOLL_CTL_ADD, netfd, &ev[0]) < 0) {
-				log_perror("epoll_ctl");
-				ret_val = -1;
-			} else{
-				while(run) {
-					int n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
+		while(run) {
+			int n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
 
-					while(--n >= 0) {
-						struct connection *con;
+			while(--n >= 0) {
+				struct connection *con;
 
-						con = ev[n].data.ptr;
+				con = ev[n].data.ptr;
 
-						/* If con->fd is netfd, don't use any other members of con!
-						   In this case, con really points to just an int, not a struct conn! */
+				/*
+				 * HACK: We don't initialize the address structure when allocating a
+				 * in6_server, so we can tell by the unset family, that we're dealing
+				 * with a server.
+				 */
+				if(!con->addr->sa_family) {
+					/* new TCP connection -> set up connection */
 
-						if(con->fd == netfd) {
-							/* new TCP connection -> set up connection */
+					struct epoll_event nev;
+					struct in6_connection *new_client;
 
-							struct epoll_event nev;
-							struct in6_connection *new_client;
+					if (!(new_client = calloc(1, sizeof(*new_client)))) {
+						log_perror("calloc");
+					} else {
+						new_client->conn.addr = (struct sockaddr*)&new_client->addr;
+						new_client->conn.addr_size = sizeof(new_client->addr);
+						new_client->conn.fd = accept(con->fd, new_client->conn.addr, &new_client->conn.addr_size);
 
-							if (!(new_client = calloc(1, sizeof(*new_client)))) {
-								log_perror("calloc");
-							} else {
-								new_client->conn.addr = (struct sockaddr*)&new_client->addr;
-								new_client->conn.addr_size = sizeof(new_client->addr);
-							        new_client->conn.fd = accept(con->fd, new_client->conn.addr, &new_client->conn.addr_size);
-
-								if(new_client->conn.fd < 0) {
-									free(new_client);
-								} else {
-									nev.data.ptr = new_client;
-									nev.events = EPOLLIN;
-
-									if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_client->conn.fd, &nev) < 0) {
-										log_perror("epoll_ctl");
-										close(new_client->conn.fd);
-										free(new_client);
-									} else if((err = array_insert(conns, new_client)) < 0) {
-										log_error("array_insert: %s\n", strerror(-err));
-										close(new_client->conn.fd);
-										free(new_client);
-									}
-								}
-							}
-						} else if(con->addr->sa_family == AF_CAN) {
-							/* message from CAN bus -> broadcast to TCP clients */
-
-							struct can_frame frm;
-							int flen;
-
-							if((flen = read(con->fd, &frm, sizeof(frm))) < 0) {
-								log_perror("read");
-							} else if(flen == sizeof(frm)) {
-								broadcast_net(&frm);
-							} else {
-								log_error("flen = %d\n", flen);
-							}
+						if(new_client->conn.fd < 0) {
+							free(new_client);
 						} else {
-							/* message from TCP client -> broadcast to TCP clients and CAN bus */
+							nev.data.ptr = new_client;
+							nev.events = EPOLLIN;
 
-							struct in6_connection *client;
-							size_t rsize;
-							int rd;
-
-							client = (struct in6_connection*)con;
-							rsize = sizeof(client->data) - client->dlen;
-
-							if(rsize > 0) {
-								rd = recv(client->conn.fd, client->data.raw + client->dlen, rsize, 0);
-
-								if(rd > 0) {
-									client->dlen += rd;
-								}
-							}
-
-							/* broadcast buffered frames */
-							if(client->dlen >= sizeof(struct can_frame)) {
-								size_t new_dlen;
-								int idx;
-
-								idx = 0;
-								new_dlen = client->dlen;
-
-								/* send out the frames that were fully buffered */
-
-								while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-									broadcast_can(&(client->data.frame[idx]));
-									broadcast_net2(&(client->data.frame[idx]), (struct connection*)client);
-									idx++;
-									new_dlen -= sizeof(struct can_frame);
-								}
-
-								/* if we have a partial frame, move it to the front of the buffer */
-								if(new_dlen > 0) {
-									memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
-								}
-
-								client->dlen = new_dlen;
-							}
-
-							if(rd <= 0) {
-								/* error (-1) or connection closed (0) */
-								array_remove(conns, client);
-								close(client->conn.fd);
-								free(client);
+							if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_client->conn.fd, &nev) < 0) {
+								log_perror("epoll_ctl");
+								close(new_client->conn.fd);
+								free(new_client);
+							} else if((err = array_insert(conns, new_client)) < 0) {
+								log_error("array_insert: %s\n", strerror(-err));
+								close(new_client->conn.fd);
+								free(new_client);
 							}
 						}
 					}
-				} /* while(run) */
+				} else if(con->addr->sa_family == AF_CAN) {
+					/* message from CAN bus -> broadcast to TCP clients */
+
+					struct can_frame frm;
+					int flen;
+
+					if((flen = read(con->fd, &frm, sizeof(frm))) < 0) {
+						log_perror("read");
+					} else if(flen == sizeof(frm)) {
+						broadcast_net(&frm);
+					} else {
+						log_error("flen = %d\n", flen);
+					}
+				} else {
+					/* message from TCP client -> broadcast to TCP clients and CAN bus */
+
+					struct in6_connection *client;
+					size_t rsize;
+					int rd;
+
+					client = (struct in6_connection*)con;
+					rsize = sizeof(client->data) - client->dlen;
+
+					if(rsize > 0) {
+						rd = recv(client->conn.fd, client->data.raw + client->dlen, rsize, 0);
+
+						if(rd > 0) {
+							client->dlen += rd;
+						}
+					}
+
+					/* broadcast buffered frames */
+					if(client->dlen >= sizeof(struct can_frame)) {
+						size_t new_dlen;
+						int idx;
+
+						idx = 0;
+						new_dlen = client->dlen;
+
+						/* send out the frames that were fully buffered */
+
+						while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
+							broadcast_can(&(client->data.frame[idx]));
+							broadcast_net2(&(client->data.frame[idx]), (struct connection*)client);
+							idx++;
+							new_dlen -= sizeof(struct can_frame);
+						}
+
+						/* if we have a partial frame, move it to the front of the buffer */
+						if(new_dlen > 0) {
+							memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
+						}
+
+						client->dlen = new_dlen;
+					}
+
+					if(rd <= 0) {
+						/* error (-1) or connection closed (0) */
+						array_remove(conns, client);
+						close(client->conn.fd);
+						free(client);
+					}
+				}
 			}
-			close(netfd);
-		}
+		} /* while(run) */
 	} else { /* if(flags & FLAG_LISTEN) */
 		struct in6_connection client;
 
