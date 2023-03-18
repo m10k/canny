@@ -191,6 +191,27 @@ static struct in6_server* in6_server(unsigned short port)
 	return server;
 }
 
+static struct in6_connection* in6_client(const char *hostname, unsigned short port)
+{
+	struct in6_connection *conn;
+	int fd;
+
+	if ((fd = in6connect(hostname, port) < 0)) {
+		log_error("Unable to connect to %s:%d\n", hostname, port & 0xffff);
+		return NULL;
+	}
+
+	if (!(conn = calloc(1, sizeof(*conn)))) {
+		close(fd);
+	} else {
+		conn->conn.fd = fd;
+		conn->conn.addr = (struct sockaddr*)&conn->addr;
+		conn->conn.addr_size = sizeof(conn->addr);
+	}
+
+	return conn;
+}
+
 static int cansock(int ifindex)
 {
 	struct sockaddr_can addr;
@@ -313,6 +334,12 @@ static void in6_server_free(struct in6_server *server)
 	free(server);
 }
 
+static void in6_connection_free(struct in6_connection *conn)
+{
+	close(conn->conn.fd);
+	free(conn);
+}
+
 static int server_init(unsigned short port)
 {
 	struct in6_server *server;
@@ -327,6 +354,31 @@ static int server_init(unsigned short port)
 
 	} else {
 		log_info("Waiting for clients on port %hu (fd %d)\n", port, server->conn.fd);
+	}
+
+	return 0;
+}
+
+static int client_init(const char *hostname, unsigned short port)
+{
+	struct in6_connection *client;
+
+	if (!(client = in6_client(hostname, port))) {
+		log_error("Could not connect to %s:%hu\n", hostname, port);
+		return 1;
+
+	} else if (watch_fd(client->conn.fd, client) < 0) {
+		log_error("Could not add client (fd %d) to epoll set\n", client->conn.fd);
+		in6_connection_free(client);
+		return 1;
+
+	} else if (array_insert(conns, client) < 0) {
+		log_error("Could not add client to connection array\n");
+		in6_connection_free(client);
+		return 1;
+
+	} else {
+		log_info("Connected to %s:%hu (fd %d)\n", hostname, port, client->conn.fd);
 	}
 
 	return 0;
@@ -470,7 +522,6 @@ int main(int argc, char *argv[])
 	struct epoll_event ev[CONFIG_EPOLL_INITSIZE];
 	char *hostname;
 	int port;
-	int netfd;
 	int ret_val;
 	int flags;
 	int err;
@@ -636,86 +687,72 @@ int main(int argc, char *argv[])
 			}
 		} /* while(run) */
 	} else { /* if(flags & FLAG_LISTEN) */
-		struct in6_connection client;
+		if (client_init(hostname, port & 0xffff) < 0) {
+			return 1;
+		}
 
-		memset(&client, 0, sizeof(client));
+		while(run) {
+			int n;
 
-		if((netfd = in6connect(hostname, port & 0xffff)) < 0) {
-			log_error("Unable to connect to %s:%d\n", hostname, port & 0xffff);
-		} else {
-			client.conn.fd = netfd;
-			ev[0].data.ptr = &client;
-			ev[0].events = EPOLLIN;
+			n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
 
-			if(epoll_ctl(epfd, EPOLL_CTL_ADD, client.conn.fd, &ev[0]) < 0) {
-				log_perror("epoll_ctl");
-			} else {
-				int n;
+			while(--n >= 0) {
+				struct connection *con;
+				int len;
 
-				while(run) {
-					n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
+				con = (struct connection*)ev[n].data.ptr;
 
-					while(--n >= 0) {
-						struct connection *con;
-						int len;
+				if(con->addr->sa_family == AF_CAN) {
+					struct can_frame frm;
 
-						con = (struct connection*)ev[n].data.ptr;
+					len = read(con->fd, &frm, sizeof(frm));
 
-						if(con->addr->sa_family == AF_CAN) {
-							struct can_frame frm;
+					if(len == sizeof(frm)) {
+						broadcast_net(&frm);
+					}
+				} else {
+					struct in6_connection *client;
+					size_t rsize;
 
-							len = read(con->fd, &frm, sizeof(frm));
+					client = (struct in6_connection*)con;
+					rsize = sizeof(client->data) - client->dlen;
 
-							if(len == sizeof(frm)) {
-								if(send(netfd, &frm, sizeof(frm), 0) < 0) {
-									log_perror("send");
-									close(netfd);
-									run = 0;
-								}
-							}
-						} else {
-							size_t rsize;
+					if(rsize > 0) {
+						len = recv(con->fd, client->data.raw + client->dlen, rsize, 0);
 
-							rsize = sizeof(client.data) - client.dlen;
-
-							if(rsize > 0) {
-								len = recv(netfd, client.data.raw + client.dlen, rsize, 0);
-
-								if(len > 0) {
-									client.dlen += len;
-								}
-							}
-
-							/* broadcast buffered frames */
-							if(client.dlen >= sizeof(struct can_frame)) {
-								size_t new_dlen;
-								int idx;
-
-								idx = 0;
-								new_dlen = client.dlen;
-
-								/* send out the frames that were fully buffered */
-
-								while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-									broadcast_can(&(client.data.frame[idx]));
-									idx++;
-									new_dlen -= sizeof(struct can_frame);
-								}
-
-								/* if we have a partial frame, move it to the front of the buffer */
-								if(new_dlen > 0) {
-									memcpy(client.data.raw, client.data.raw + (client.dlen - new_dlen), new_dlen);
-								}
-
-								client.dlen = new_dlen;
-							}
-
-							if(len <= 0) {
-								/* error (-1) or connection closed (0) */
-								close(netfd);
-								run = 0;
-							}
+						if(len > 0) {
+							client->dlen += len;
 						}
+					}
+
+					/* broadcast buffered frames */
+					if(client->dlen >= sizeof(struct can_frame)) {
+						size_t new_dlen;
+						int idx;
+
+						idx = 0;
+						new_dlen = client->dlen;
+
+						/* send out the frames that were fully buffered */
+
+						while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
+							broadcast_can(&(client->data.frame[idx]));
+							idx++;
+							new_dlen -= sizeof(struct can_frame);
+						}
+
+						/* if we have a partial frame, move it to the front of the buffer */
+						if(new_dlen > 0) {
+							memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
+						}
+
+						client->dlen = new_dlen;
+					}
+
+					if(len <= 0) {
+						/* error (-1) or connection closed (0) */
+						in6_connection_free(client);
+						run = 0;
 					}
 				}
 			}
