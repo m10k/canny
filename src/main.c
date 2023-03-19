@@ -57,6 +57,9 @@ struct connection {
 	int fd;
 	struct sockaddr *addr;
 	socklen_t addr_size;
+
+	void (*input_event)(struct connection*);
+	void (*close_event)(struct connection*);
 };
 
 struct in6_connection {
@@ -84,6 +87,11 @@ static array_t *conns;
 static array_t *ifaces;
 static int run;
 static int epfd;
+
+static void can_input_event(struct can_iface *iface);
+static void in6_client_input_event(struct in6_connection *client);
+static void in6_client_close_event(struct in6_connection *client);
+static void in6_server_input_event(struct in6_server *server);
 
 static int in6connect(const char *host, unsigned short port)
 {
@@ -186,6 +194,7 @@ static struct in6_server* in6_server(unsigned short port)
 		server->conn.fd = fd;
 		server->conn.addr = (struct sockaddr*)&server->addr;
 		server->conn.addr_size = sizeof(server->addr);
+		server->conn.input_event = (void(*)(struct connection*))in6_server_input_event;
 	}
 
 	return server;
@@ -207,6 +216,8 @@ static struct in6_connection* in6_client(const char *hostname, unsigned short po
 		conn->conn.fd = fd;
 		conn->conn.addr = (struct sockaddr*)&conn->addr;
 		conn->conn.addr_size = sizeof(conn->addr);
+		conn->conn.input_event = (void(*)(struct connection*))in6_client_input_event;
+		conn->conn.close_event = (void(*)(struct connection*))in6_client_close_event;
 	}
 
 	return conn;
@@ -269,6 +280,7 @@ static struct can_iface* can_open(int ifindex)
 		iface->conn.fd = fd;
 		iface->conn.addr = (struct sockaddr*)&iface->addr;
 		iface->conn.addr_size = sizeof(iface->addr);
+		iface->conn.input_event = (void(*)(struct connection*))can_input_event;
 		iface->addr.can_family = AF_CAN;
 		iface->addr.can_ifindex = ifindex;
 	}
@@ -421,6 +433,117 @@ static void broadcast_net2(struct can_frame *frm, struct connection *src)
 	return;
 }
 
+static void can_input_event(struct can_iface *iface)
+{
+	struct can_frame frm;
+	int flen;
+
+	if((flen = read(iface->conn.fd, &frm, sizeof(frm))) < 0) {
+		log_perror("read");
+	} else if(flen == sizeof(frm)) {
+		broadcast_net(&frm);
+	} else {
+		log_error("flen = %d\n", flen);
+	}
+}
+
+static void in6_client_input_event(struct in6_connection *client)
+{
+	size_t rsize;
+	int len;
+
+	rsize = sizeof(client->data) - client->dlen;
+	len = 1;
+
+	if(rsize > 0) {
+		len = recv(client->conn.fd, client->data.raw + client->dlen, rsize, 0);
+
+		if(len > 0) {
+			client->dlen += len;
+		}
+	}
+
+	/* broadcast buffered frames */
+	if(client->dlen >= sizeof(struct can_frame)) {
+		size_t new_dlen;
+		int idx;
+
+		idx = 0;
+		new_dlen = client->dlen;
+
+		/* send out the frames that were fully buffered */
+
+		while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
+			broadcast_can(&(client->data.frame[idx]));
+			broadcast_net2(&(client->data.frame[idx]), (struct connection*)client);
+			idx++;
+			new_dlen -= sizeof(struct can_frame);
+		}
+
+		/* if we have a partial frame, move it to the front of the buffer */
+		if(new_dlen > 0) {
+			memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
+		}
+
+		client->dlen = new_dlen;
+	}
+
+	if(len <= 0) {
+		/* error (-1) or connection closed (0) */
+		if (client->conn.close_event) {
+			client->conn.close_event((struct connection*)client);
+		}
+
+		array_remove(conns, client);
+		in6_connection_free(client);
+	}
+}
+
+static void in6_client_close_event(struct in6_connection *client)
+{
+	/*
+	 * This event is attached only when canny is acting as a client.
+	 * When the connection to the server is closed, stop the main loop.
+	 */
+	log_info("Connection to server (fd %d) closed. Quitting.\n", client->conn.fd);
+	run = 0;
+}
+
+static void in6_server_input_event(struct in6_server *server)
+{
+	struct epoll_event nev;
+	struct in6_connection *new_client;
+	int err;
+
+	if (!(new_client = calloc(1, sizeof(*new_client)))) {
+		log_perror("calloc");
+	} else {
+		new_client->conn.addr = (struct sockaddr*)&new_client->addr;
+		new_client->conn.addr_size = sizeof(new_client->addr);
+		new_client->conn.fd = accept(server->conn.fd, new_client->conn.addr,
+					     &new_client->conn.addr_size);
+		new_client->conn.input_event = (void(*)(struct connection*))in6_client_input_event;
+		/* don't need the close_event when canny is acting as server */
+
+		if(new_client->conn.fd < 0) {
+			free(new_client);
+		} else {
+			nev.data.ptr = new_client;
+			nev.events = EPOLLIN;
+
+			if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_client->conn.fd, &nev) < 0) {
+				log_perror("epoll_ctl");
+				close(new_client->conn.fd);
+				free(new_client);
+			} else if((err = array_insert(conns, new_client)) < 0) {
+				log_error("array_insert: %s\n", strerror(-err));
+				close(new_client->conn.fd);
+				free(new_client);
+			}
+		}
+	}
+}
+
 static void handle_signal(int sig)
 {
 	switch(sig) {
@@ -524,7 +647,6 @@ int main(int argc, char *argv[])
 	int port;
 	int ret_val;
 	int flags;
-	int err;
 
 	port = CONFIG_INET_PORT;
 	flags = FLAG_DAEMON | FLAG_LISTEN;
@@ -577,185 +699,26 @@ int main(int argc, char *argv[])
 		if (server_init(port & 0xffff) < 0) {
 			return 1;
 		}
-
-		while(run) {
-			int n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
-
-			while(--n >= 0) {
-				struct connection *con;
-
-				con = ev[n].data.ptr;
-
-				/*
-				 * HACK: We don't initialize the address structure when allocating a
-				 * in6_server, so we can tell by the unset family, that we're dealing
-				 * with a server.
-				 */
-				if(!con->addr->sa_family) {
-					/* new TCP connection -> set up connection */
-
-					struct epoll_event nev;
-					struct in6_connection *new_client;
-
-					if (!(new_client = calloc(1, sizeof(*new_client)))) {
-						log_perror("calloc");
-					} else {
-						new_client->conn.addr = (struct sockaddr*)&new_client->addr;
-						new_client->conn.addr_size = sizeof(new_client->addr);
-						new_client->conn.fd = accept(con->fd, new_client->conn.addr, &new_client->conn.addr_size);
-
-						if(new_client->conn.fd < 0) {
-							free(new_client);
-						} else {
-							nev.data.ptr = new_client;
-							nev.events = EPOLLIN;
-
-							if(epoll_ctl(epfd, EPOLL_CTL_ADD, new_client->conn.fd, &nev) < 0) {
-								log_perror("epoll_ctl");
-								close(new_client->conn.fd);
-								free(new_client);
-							} else if((err = array_insert(conns, new_client)) < 0) {
-								log_error("array_insert: %s\n", strerror(-err));
-								close(new_client->conn.fd);
-								free(new_client);
-							}
-						}
-					}
-				} else if(con->addr->sa_family == AF_CAN) {
-					/* message from CAN bus -> broadcast to TCP clients */
-
-					struct can_frame frm;
-					int flen;
-
-					if((flen = read(con->fd, &frm, sizeof(frm))) < 0) {
-						log_perror("read");
-					} else if(flen == sizeof(frm)) {
-						broadcast_net(&frm);
-					} else {
-						log_error("flen = %d\n", flen);
-					}
-				} else {
-					/* message from TCP client -> broadcast to TCP clients and CAN bus */
-
-					struct in6_connection *client;
-					size_t rsize;
-					int rd;
-
-					client = (struct in6_connection*)con;
-					rsize = sizeof(client->data) - client->dlen;
-
-					if(rsize > 0) {
-						rd = recv(client->conn.fd, client->data.raw + client->dlen, rsize, 0);
-
-						if(rd > 0) {
-							client->dlen += rd;
-						}
-					}
-
-					/* broadcast buffered frames */
-					if(client->dlen >= sizeof(struct can_frame)) {
-						size_t new_dlen;
-						int idx;
-
-						idx = 0;
-						new_dlen = client->dlen;
-
-						/* send out the frames that were fully buffered */
-
-						while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-							broadcast_can(&(client->data.frame[idx]));
-							broadcast_net2(&(client->data.frame[idx]), (struct connection*)client);
-							idx++;
-							new_dlen -= sizeof(struct can_frame);
-						}
-
-						/* if we have a partial frame, move it to the front of the buffer */
-						if(new_dlen > 0) {
-							memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
-						}
-
-						client->dlen = new_dlen;
-					}
-
-					if(rd <= 0) {
-						/* error (-1) or connection closed (0) */
-						array_remove(conns, client);
-						close(client->conn.fd);
-						free(client);
-					}
-				}
-			}
-		} /* while(run) */
-	} else { /* if(flags & FLAG_LISTEN) */
+	} else {
 		if (client_init(hostname, port & 0xffff) < 0) {
 			return 1;
 		}
+	}
 
-		while(run) {
-			int n;
+	while(run) {
+		int n;
 
-			n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
+		n = epoll_wait(epfd, ev, CONFIG_EPOLL_INITSIZE, -1);
 
-			while(--n >= 0) {
-				struct connection *con;
-				int len;
+		while(--n >= 0) {
+			struct connection *con;
 
-				con = (struct connection*)ev[n].data.ptr;
+			con = ev[n].data.ptr;
 
-				if(con->addr->sa_family == AF_CAN) {
-					struct can_frame frm;
-
-					len = read(con->fd, &frm, sizeof(frm));
-
-					if(len == sizeof(frm)) {
-						broadcast_net(&frm);
-					}
-				} else {
-					struct in6_connection *client;
-					size_t rsize;
-
-					client = (struct in6_connection*)con;
-					rsize = sizeof(client->data) - client->dlen;
-
-					if(rsize > 0) {
-						len = recv(con->fd, client->data.raw + client->dlen, rsize, 0);
-
-						if(len > 0) {
-							client->dlen += len;
-						}
-					}
-
-					/* broadcast buffered frames */
-					if(client->dlen >= sizeof(struct can_frame)) {
-						size_t new_dlen;
-						int idx;
-
-						idx = 0;
-						new_dlen = client->dlen;
-
-						/* send out the frames that were fully buffered */
-
-						while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-							broadcast_can(&(client->data.frame[idx]));
-							idx++;
-							new_dlen -= sizeof(struct can_frame);
-						}
-
-						/* if we have a partial frame, move it to the front of the buffer */
-						if(new_dlen > 0) {
-							memcpy(client->data.raw, client->data.raw + (client->dlen - new_dlen), new_dlen);
-						}
-
-						client->dlen = new_dlen;
-					}
-
-					if(len <= 0) {
-						/* error (-1) or connection closed (0) */
-						in6_connection_free(client);
-						run = 0;
-					}
-				}
+			if (!con->input_event) {
+				continue;
 			}
+			con->input_event(con);
 		}
 	}
 
