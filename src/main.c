@@ -270,7 +270,7 @@ static struct can_iface* can_open(int ifindex)
 	struct can_iface *iface;
 	int fd;
 
-	if ((fd = cansock(ifindex) < 0)) {
+	if ((fd = cansock(ifindex)) < 0) {
 		return NULL;
 	}
 
