@@ -81,6 +81,7 @@ struct in6_server {
 struct can_iface {
 	struct connection conn;
 	struct sockaddr_can addr;
+	char name[32];
 };
 
 static array_t *conns;
@@ -265,7 +266,7 @@ static int watch_fd(int fd, void *data)
 	return err;
 }
 
-static struct can_iface* can_open(int ifindex)
+static struct can_iface* can_open(const char *ifname, int ifindex)
 {
 	struct can_iface *iface;
 	int fd;
@@ -283,6 +284,7 @@ static struct can_iface* can_open(int ifindex)
 		iface->conn.input_event = (void(*)(struct connection*))can_input_event;
 		iface->addr.can_family = AF_CAN;
 		iface->addr.can_ifindex = ifindex;
+		snprintf(iface->name, sizeof(iface->name), "%s", ifname);
 	}
 
 	return iface;
@@ -315,7 +317,7 @@ static int can_init(void)
 
 			log_info("Found CAN interface: %s\n", ifr.ifr_name);
 
-			if (!(iface = can_open(ifr.ifr_ifindex))) {
+			if (!(iface = can_open(ifr.ifr_name, ifr.ifr_ifindex))) {
 				log_warn("Could not open interface %s\n", ifr.ifr_name);
 
 			} else if (watch_fd(iface->conn.fd, iface) < 0) {
