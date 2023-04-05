@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/can.h>
+#include <linux/can/raw.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -299,6 +300,23 @@ static int get_iface_mtu(const char *ifname)
         return ret_val;
 }
 
+static int enable_canfd(int sock)
+{
+	int err;
+	int value;
+
+	value = 1;
+	err = setsockopt(sock, SOL_CAN_RAW, CAN_RAW_FD_FRAMES,
+			 &value, sizeof(value));
+
+	if (err < 0) {
+		err = -errno;
+		log_perror("setsockopt");
+	}
+
+	return err;
+}
+
 static struct can_iface* can_open(const char *ifname, int ifindex)
 {
 	struct can_iface *iface;
@@ -335,6 +353,13 @@ static struct can_iface* can_open(const char *ifname, int ifindex)
 
 		case CANFD_MTU:
 			iface->type = CAN_TYPE_FD;
+
+			if (enable_canfd(fd) < 0) {
+				log_error("Could not enable CANFD mode on %s. Falling back to CAN2.0B.\n",
+					  iface->name);
+				iface->type = CAN_TYPE_20B;
+			}
+
 			break;
 		}
 	}
