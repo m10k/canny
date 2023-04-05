@@ -78,10 +78,17 @@ struct in6_server {
 	struct sockaddr_in6 addr;
 };
 
+typedef enum {
+	CAN_TYPE_20B,
+	CAN_TYPE_FD
+} can_type_t;
+
 struct can_iface {
 	struct connection conn;
 	struct sockaddr_can addr;
 	char name[32];
+	can_type_t type;
+	int mtu;
 };
 
 static array_t *conns;
@@ -266,6 +273,32 @@ static int watch_fd(int fd, void *data)
 	return err;
 }
 
+static int get_iface_mtu(const char *ifname)
+{
+        struct ifreq ifr;
+        int ret_val;
+        int fd;
+
+        if ((fd = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
+                ret_val = -errno;
+                log_perror("socket");
+        } else {
+                memset(&ifr, 0, sizeof(ifr));
+                snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+
+                if (ioctl(fd, SIOCGIFMTU, &ifr) < 0) {
+                        ret_val = -errno;
+                        log_perror("ioctl");
+                } else {
+                        ret_val = ifr.ifr_mtu;
+                }
+
+                close(fd);
+        }
+
+        return ret_val;
+}
+
 static struct can_iface* can_open(const char *ifname, int ifindex)
 {
 	struct can_iface *iface;
@@ -285,6 +318,25 @@ static struct can_iface* can_open(const char *ifname, int ifindex)
 		iface->addr.can_family = AF_CAN;
 		iface->addr.can_ifindex = ifindex;
 		snprintf(iface->name, sizeof(iface->name), "%s", ifname);
+
+		if ((iface->mtu = get_iface_mtu(iface->name)) < 0) {
+			log_warn("Could not determine MTU of %s. Assuming %d.\n", iface->name, CAN_MTU);
+			iface->mtu = CAN_MTU;
+		}
+
+		switch (iface->mtu) {
+		default:
+			log_warn("MTU of %s is neither %d nor %d. Assuming CAN2.0B.\n",
+				 iface->name, CAN_MTU, CANFD_MTU);
+			/* fall-through */
+		case CAN_MTU:
+			iface->type = CAN_TYPE_20B;
+			break;
+
+		case CANFD_MTU:
+			iface->type = CAN_TYPE_FD;
+			break;
+		}
 	}
 
 	return iface;
