@@ -497,6 +497,12 @@ static void broadcast_msg_to_can(struct canny_message *msg)
 	len = msg->type == CANNY_MSG_TYPE_20B ? CAN_MTU : CANFD_MTU;
 
 	ARRAY_FOREACH(ifaces, struct connection, con, {
+		if (msg->type == CANNY_MSG_TYPE_FD &&
+		    ((struct can_iface*)con)->type != CAN_TYPE_FD) {
+			/* don't forward FD frames on non-FD interfaces */
+			continue;
+		}
+
 		if(sendto(con->fd, &msg->payload, len, 0, con->addr, con->addr_size) < 0) {
 			log_perror("sendto");
 		}
