@@ -54,6 +54,21 @@ static const struct option cmd_opts[] = {
 	{ 0, 0, 0, 0 }
 };
 
+#define CANNY_MSG_VER       1
+#define CANNY_MSG_TYPE_20B  CAN_TYPE_20B
+#define CANNY_MSG_TYPE_FD   CAN_TYPE_FD
+
+struct canny_message {
+	uint8_t ver;
+	uint8_t type;
+	uint16_t len;
+
+	union {
+		struct can_frame can;
+		struct canfd_frame canfd;
+	} payload;
+} __attribute__((packed));
+
 struct connection {
 	int fd;
 	struct sockaddr *addr;
@@ -68,8 +83,8 @@ struct in6_connection {
 	struct sockaddr_in6 addr;
 
 	union {
-		struct can_frame frame[CONFIG_BUFFER_FRAMES];
-		unsigned char raw[CONFIG_BUFFER_FRAMES * sizeof(struct can_frame)];
+		struct canny_message msg[CONFIG_BUFFER_FRAMES];
+		unsigned char raw[CONFIG_BUFFER_FRAMES * sizeof(struct canny_message)];
 	} __attribute__((packed)) data;
 	size_t dlen;
 };
@@ -80,7 +95,7 @@ struct in6_server {
 };
 
 typedef enum {
-	CAN_TYPE_20B,
+	CAN_TYPE_20B = 1,
 	CAN_TYPE_FD
 } can_type_t;
 
@@ -475,10 +490,14 @@ static int client_init(const char *hostname, unsigned short port)
 	return 0;
 }
 
-static void broadcast_can(struct can_frame *frm)
+static void broadcast_msg_to_can(struct canny_message *msg)
 {
+	size_t len;
+
+	len = msg->type == CANNY_MSG_TYPE_20B ? CAN_MTU : CANFD_MTU;
+
 	ARRAY_FOREACH(ifaces, struct connection, con, {
-		if(sendto(con->fd, frm, sizeof(*frm), 0, con->addr, con->addr_size) < 0) {
+		if(sendto(con->fd, &msg->payload, len, 0, con->addr, con->addr_size) < 0) {
 			log_perror("sendto");
 		}
 	});
@@ -486,10 +505,45 @@ static void broadcast_can(struct can_frame *frm)
 	return;
 }
 
-static void broadcast_net(struct can_frame *frm)
+static int frame_to_message(struct canny_message *msg, struct canfd_frame *frame, size_t framesize)
 {
+	int err;
+
+	memset(msg, 0, sizeof(*msg));
+	msg->ver = CANNY_MSG_VER;
+	msg->len = framesize;
+	err = 0;
+
+	switch (framesize) {
+	case CANFD_MTU:
+		memcpy(&msg->payload.canfd, frame, CANFD_MTU);
+		msg->type = CANNY_MSG_TYPE_FD;
+		break;
+
+	case CAN_MTU:
+		memcpy(&msg->payload.can, frame, CAN_MTU);
+		msg->type = CANNY_MSG_TYPE_20B;
+		break;
+
+	default:
+		err = -EINVAL;
+		break;
+	}
+
+	return err;
+}
+
+static void broadcast_frame_to_net(struct canfd_frame *frm, size_t len)
+{
+	struct canny_message msg;
+
+	if (frame_to_message(&msg, frm, len) < 0) {
+		log_error("Invalid frame length: %llu\n", len);
+		return;
+	}
+
 	ARRAY_FOREACH(conns, struct connection, con, {
-		if(send(con->fd, frm, sizeof(*frm), 0) < 0) {
+		if(send(con->fd, &msg, sizeof(msg), 0) < 0) {
 			log_perror("send");
 		}
 	});
@@ -497,14 +551,14 @@ static void broadcast_net(struct can_frame *frm)
 	return;
 }
 
-static void broadcast_net2(struct can_frame *frm, struct connection *src)
+static void broadcast_msg_to_net(struct canny_message *msg, struct connection *src)
 {
 	ARRAY_FOREACH(conns, struct connection, con, {
 		if(con->fd == src->fd) {
 			continue;
 		}
 
-		if(send(con->fd, frm, sizeof(*frm), 0) < 0) {
+		if(send(con->fd, msg, sizeof(*msg), 0) < 0) {
 			log_perror("send");
 		}
 	});
@@ -514,15 +568,16 @@ static void broadcast_net2(struct can_frame *frm, struct connection *src)
 
 static void can_input_event(struct can_iface *iface)
 {
-	struct can_frame frm;
+	struct canfd_frame frm;
 	int flen;
 
 	if((flen = read(iface->conn.fd, &frm, sizeof(frm))) < 0) {
 		log_perror("read");
-	} else if(flen == sizeof(frm)) {
-		broadcast_net(&frm);
+	} else if (flen == CAN_MTU || flen == CANFD_MTU) {
+		broadcast_frame_to_net(&frm, (size_t)flen);
 	} else {
-		log_error("flen = %d\n", flen);
+		log_error("Received %d bytes message on %s. Expected %d or %d bytes.\n",
+			  flen, iface->name, CAN_MTU, CANFD_MTU);
 	}
 }
 
@@ -543,7 +598,7 @@ static void in6_client_input_event(struct in6_connection *client)
 	}
 
 	/* broadcast buffered frames */
-	if(client->dlen >= sizeof(struct can_frame)) {
+	if(client->dlen >= sizeof(struct canny_message)) {
 		size_t new_dlen;
 		int idx;
 
@@ -552,11 +607,11 @@ static void in6_client_input_event(struct in6_connection *client)
 
 		/* send out the frames that were fully buffered */
 
-		while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct can_frame)) {
-			broadcast_can(&(client->data.frame[idx]));
-			broadcast_net2(&(client->data.frame[idx]), (struct connection*)client);
+		while(idx < CONFIG_BUFFER_FRAMES && new_dlen >= sizeof(struct canny_message)) {
+			broadcast_msg_to_can(&(client->data.msg[idx]));
+			broadcast_msg_to_net(&(client->data.msg[idx]), (struct connection*)client);
 			idx++;
-			new_dlen -= sizeof(struct can_frame);
+			new_dlen -= sizeof(struct canny_message);
 		}
 
 		/* if we have a partial frame, move it to the front of the buffer */
